@@ -2206,6 +2206,9 @@ class CanvasModel with ChangeNotifier {
   double _y = 0;
   // image scale
   double _scale = 1.0;
+  // Freeze mobile canvas gestures. Supported Android peers receive raw touch
+  // contacts while this is enabled.
+  bool _locked = false;
   double _devicePixelRatio = 1.0;
   Size _size = Size.zero;
   // the tabbar over the image
@@ -2254,11 +2257,18 @@ class CanvasModel with ChangeNotifier {
   double get x => _x;
   double get y => _y;
   double get scale => _scale;
+  bool get locked => _locked;
   double get devicePixelRatio => _devicePixelRatio;
   Size get size => _size;
   ScrollStyle get scrollStyle => _scrollStyle;
   ViewStyle get viewStyle => _lastViewStyle;
   RxBool get imageOverflow => _imageOverflow;
+
+  void setLocked(bool value) {
+    if (_locked == value) return;
+    _locked = value;
+    notifyListeners();
+  }
 
   _resetScroll() => setScrollPercent(0.0, 0.0);
 
@@ -2720,6 +2730,7 @@ class CanvasModel with ChangeNotifier {
     _x = 0;
     _y = 0;
     _scale = 1.0;
+    _locked = false;
     _lastViewStyle = ViewStyle.defaultViewStyle();
     _timerMobileFocusCanvasCursor?.cancel();
     _timerMobileRestoreCanvasOffset?.cancel();
@@ -3996,6 +4007,7 @@ class FFI {
   /// Close the remote session.
   Future<void> close({bool closeSession = true}) async {
     closed = true;
+    canvasModel.setLocked(false);
     chatModel.close();
     // Close all terminal models
     for (final model in _terminalModels.values) {
@@ -4141,6 +4153,7 @@ class PeerInfo with ChangeNotifier {
 
   bool get isWayland => platformAdditions[kPlatformAdditionsIsWayland] == true;
   bool get isHeadless => platformAdditions[kPlatformAdditionsHeadless] == true;
+  bool get rawTouch => platformAdditions[kPlatformAdditionsRawTouch] == true;
   bool get isInstalled =>
       platform != kPeerPlatformWindows ||
       platformAdditions[kPlatformAdditionsIsInstalled] == true;

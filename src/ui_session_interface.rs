@@ -25,6 +25,7 @@ use hbb_common::{
     },
     whoami, Stream,
 };
+use hbb_common::protobuf::Message as _;
 use rdev::{Event, EventType::*, KeyCode};
 #[cfg(all(feature = "vram", feature = "flutter"))]
 use std::ffi::c_void;
@@ -52,6 +53,42 @@ use crate::keyboard;
 use crate::{client::Data, client::Interface};
 
 const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
+const RAW_TOUCH_POINTER_FIELD_NUMBER: u32 = 5;
+
+fn push_protobuf_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn encode_touch_pointer_event(pointer_id: u32, action: u32, x: i32, y: i32) -> Vec<u8> {
+    let mut output = Vec::with_capacity(24);
+    for (tag, value) in [
+        (0x08, pointer_id as u64),
+        (0x10, action as u64),
+        (0x18, x as i64 as u64),
+        (0x20, y as i64 as u64),
+    ] {
+        output.push(tag);
+        push_protobuf_varint(value, &mut output);
+    }
+    output
+}
+
+#[cfg(test)]
+mod raw_touch_test {
+    use super::encode_touch_pointer_event;
+
+    #[test]
+    fn test_encode_touch_pointer_event() {
+        assert_eq!(
+            encode_touch_pointer_event(9, 2, 300, 400),
+            [0x08, 0x09, 0x10, 0x02, 0x18, 0xac, 0x02, 0x20, 0x90, 0x03]
+        );
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct Session<T: InvokeUiSession> {
@@ -1198,6 +1235,30 @@ impl<T: InvokeUiSession> Session<T> {
                 return;
             }
         };
+        let mut evt = PointerDeviceEvent::new();
+        evt.set_touch_event(touch_evt);
+        send_pointer_device_event(evt, alt, ctrl, shift, command, self);
+    }
+
+    pub fn send_touch_pointer_event(
+        &self,
+        pointer_id: u32,
+        action: u32,
+        x: i32,
+        y: i32,
+        alt: bool,
+        ctrl: bool,
+        shift: bool,
+        command: bool,
+    ) {
+        let mut touch_evt = TouchEvent::new();
+        // Field 5 is a forward-compatible TouchPointerEvent extension. Keeping
+        // it as an unknown field lets this fork interoperate with the current
+        // hbb_common schema while older peers safely ignore it.
+        touch_evt.mut_unknown_fields().add_length_delimited(
+            RAW_TOUCH_POINTER_FIELD_NUMBER,
+            encode_touch_pointer_event(pointer_id, action, x, y),
+        );
         let mut evt = PointerDeviceEvent::new();
         evt.set_touch_event(touch_evt);
         send_pointer_device_event(evt, alt, ctrl, shift, command, self);

@@ -106,6 +106,9 @@ class MainService : Service() {
             "is_start" -> {
                 isStart.toString()
             }
+            "raw_touch" -> {
+                (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O).toString()
+            }
             else -> ""
         }
     }

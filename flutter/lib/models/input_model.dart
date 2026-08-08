@@ -1786,6 +1786,58 @@ class InputModel {
         sessionId: sessionId, msg: json.encode(modify(evt)));
   }
 
+  bool sendRawTouchEvent(int pointerId, int action, Offset offset) {
+    final target = parent.target;
+    if (target == null) {
+      return false;
+    }
+    final releasesContact = action == kTouchPointerActionUp ||
+        action == kTouchPointerActionCancel;
+    if (!releasesContact &&
+        (isViewOnly || !keyboardPerm || !target.ffiModel.pi.rawTouch)) {
+      return false;
+    }
+
+    final cursorModel = target.cursorModel;
+    if (action == kTouchPointerActionDown) {
+      if (cursorModel.shouldBlock(offset.dx, offset.dy) ||
+          !cursorModel.isInRemoteRect(offset) ||
+          _checkPeerControlProtected(offset.dx, offset.dy)) {
+        return false;
+      }
+    }
+
+    final rect = target.ffiModel.rect;
+    if (rect == null || rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+    final canvas = CanvasCoords.fromCanvasModel(target.canvasModel);
+    final pos = _handlePointerDevicePos(
+      kPointerEventKindTouch,
+      offset.dx - CanvasModel.leftToEdge,
+      offset.dy - CanvasModel.topToEdge,
+      false,
+      canvas,
+      rect,
+      'pointer',
+    );
+    if (pos == null) {
+      return false;
+    }
+
+    final x = pos.x.clamp(rect.left, rect.right - 1).toInt();
+    final y = pos.y.clamp(rect.top, rect.bottom - 1).toInt();
+    final evt = PointerEventToRust(kPointerEventKindTouch, 'pointer', {
+      'id': pointerId,
+      'action': action,
+      'x': x,
+      'y': y,
+    }).toJson();
+    bind.sessionSendPointer(
+        sessionId: sessionId, msg: json.encode(modify(evt)));
+    return true;
+  }
+
   bool _checkPeerControlProtected(double x, double y) {
     final cursorModel = parent.target!.cursorModel;
     if (cursorModel.isPeerControlProtected) {

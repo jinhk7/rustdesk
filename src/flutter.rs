@@ -1921,6 +1921,44 @@ fn session_send_touch_pan(
     }
 }
 
+#[inline]
+fn session_send_touch_pointer(
+    session_id: SessionID,
+    v: &serde_json::Value,
+    alt: bool,
+    ctrl: bool,
+    shift: bool,
+    command: bool,
+) {
+    let Some(value) = v.get("v") else {
+        return;
+    };
+    let (Some(pointer_id), Some(action), Some(x), Some(y)) = (
+        value.get("id").and_then(|v| v.as_u64()),
+        value.get("action").and_then(|v| v.as_u64()),
+        value.get("x").and_then(|v| v.as_i64()),
+        value.get("y").and_then(|v| v.as_i64()),
+    ) else {
+        return;
+    };
+    let (Ok(pointer_id), Ok(action), Ok(x), Ok(y)) = (
+        u32::try_from(pointer_id),
+        u32::try_from(action),
+        i32::try_from(x),
+        i32::try_from(y),
+    ) else {
+        return;
+    };
+    if pointer_id > u8::MAX as u32 || action > 3 {
+        return;
+    }
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.send_touch_pointer_event(
+            pointer_id, action, x, y, alt, ctrl, shift, command,
+        );
+    }
+}
+
 fn session_send_touch_event(
     session_id: SessionID,
     v: &serde_json::Value,
@@ -1931,6 +1969,9 @@ fn session_send_touch_event(
 ) {
     match v.get("t").and_then(|t| t.as_str()) {
         Some("scale") => session_send_touch_scale(session_id, v, alt, ctrl, shift, command),
+        Some("pointer") => {
+            session_send_touch_pointer(session_id, v, alt, ctrl, shift, command)
+        }
         Some(pan_event) => {
             session_send_touch_pan(session_id, v, pan_event, alt, ctrl, shift, command)
         }

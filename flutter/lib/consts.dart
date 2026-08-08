@@ -28,6 +28,7 @@ const String kPlatformAdditionsAmyuniVirtualDisplays =
 const String kPlatformAdditionsHasFileClipboard = "has_file_clipboard";
 const String kPlatformAdditionsSupportedPrivacyModeImpl =
     "supported_privacy_mode_impl";
+const String kPlatformAdditionsRawTouch = "raw_touch";
 
 const String kPrivacyModeImplMag = 'privacy_mode_impl_mag';
 const String kPrivacyModeImplExcludeFromCapture =
@@ -229,6 +230,11 @@ const int kWindowMainId = 0;
 
 const String kPointerEventKindTouch = "touch";
 const String kPointerEventKindMouse = "mouse";
+
+const int kTouchPointerActionDown = 0;
+const int kTouchPointerActionMove = 1;
+const int kTouchPointerActionUp = 2;
+const int kTouchPointerActionCancel = 3;
 
 const String kMouseEventTypeDefault = "";
 const String kMouseEventTypePanStart = "pan_start";

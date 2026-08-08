@@ -57,11 +57,33 @@ const val TOUCH_PAN_START = 4
 const val TOUCH_PAN_UPDATE = 5
 const val TOUCH_PAN_END = 6
 
+const val RAW_TOUCH_MASK = 0x10000
+const val RAW_TOUCH_POINTER_SHIFT = 8
+const val RAW_TOUCH_VALUE_MASK = 0xff
+const val RAW_TOUCH_DOWN = 0
+const val RAW_TOUCH_MOVE = 1
+const val RAW_TOUCH_UP = 2
+const val RAW_TOUCH_CANCEL = 3
+const val RAW_TOUCH_CANCEL_ALL = 4
+
 const val WHEEL_STEP = 120
 const val WHEEL_DURATION = 50L
 const val LONG_TAP_DELAY = 200L
 
 class InputService : AccessibilityService() {
+
+    private data class RawTouchEvent(
+        val pointerId: Int,
+        val action: Int,
+        val x: Int,
+        val y: Int,
+    )
+
+    private data class RawTouchStroke(
+        var x: Int,
+        var y: Int,
+        var stroke: GestureDescription.StrokeDescription? = null,
+    )
 
     companion object {
         var ctx: InputService? = null
@@ -99,6 +121,13 @@ class InputService : AccessibilityService() {
 
     private var lastX = 0
     private var lastY = 0
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val rawTouchEvents = LinkedList<RawTouchEvent>()
+    private val rawTouchStrokes = LinkedHashMap<Int, RawTouchStroke>()
+    private var rawTouchDispatching = false
+    private var rawTouchLastDispatchTime = 0L
+    private var legacyRawTouchPointerId: Int? = null
 
     private val volumeController: VolumeController by lazy { VolumeController(applicationContext.getSystemService(AUDIO_SERVICE) as AudioManager) }
 
@@ -224,6 +253,12 @@ class InputService : AccessibilityService() {
 
     @RequiresApi(Build.VERSION_CODES.N)
     fun onTouchInput(mask: Int, _x: Int, _y: Int) {
+        if (mask and RAW_TOUCH_MASK != 0) {
+            val pointerId = (mask shr RAW_TOUCH_POINTER_SHIFT) and RAW_TOUCH_VALUE_MASK
+            val action = mask and RAW_TOUCH_VALUE_MASK
+            onRawTouchInput(pointerId, action, _x, _y)
+            return
+        }
         when (mask) {
             TOUCH_PAN_UPDATE -> {
                 mouseX -= _x * SCREEN_INFO.scale
@@ -244,6 +279,200 @@ class InputService : AccessibilityService() {
             }
             else -> {}
         }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun onRawTouchInput(pointerId: Int, action: Int, x: Int, y: Int) {
+        if (action !in RAW_TOUCH_DOWN..RAW_TOUCH_CANCEL_ALL) {
+            return
+        }
+        mainHandler.post {
+            if (action == RAW_TOUCH_CANCEL_ALL) {
+                cancelAllRawTouches()
+                return@post
+            }
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                handleLegacyRawTouch(pointerId, action, x, y)
+                return@post
+            }
+
+            val event = RawTouchEvent(pointerId, action, x, y)
+            val last = rawTouchEvents.peekLast()
+            if (action == RAW_TOUCH_MOVE &&
+                last?.action == RAW_TOUCH_MOVE &&
+                last.pointerId == pointerId
+            ) {
+                rawTouchEvents.removeLast()
+            }
+            rawTouchEvents.add(event)
+            dispatchNextRawTouch()
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun cancelAllRawTouches() {
+        rawTouchEvents.clear()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            if (legacyRawTouchPointerId != null) {
+                endGesture(lastX, lastY)
+            }
+            resetRawTouchState()
+            return
+        }
+
+        rawTouchStrokes.forEach { (pointerId, state) ->
+            rawTouchEvents.add(
+                RawTouchEvent(pointerId, RAW_TOUCH_CANCEL, state.x, state.y)
+            )
+        }
+        if (rawTouchEvents.isNotEmpty()) {
+            dispatchNextRawTouch()
+        } else if (!rawTouchDispatching) {
+            resetRawTouchState()
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun handleLegacyRawTouch(pointerId: Int, action: Int, x: Int, y: Int) {
+        val scaledX = max(0, x) * SCREEN_INFO.scale
+        val scaledY = max(0, y) * SCREEN_INFO.scale
+        when (action) {
+            RAW_TOUCH_DOWN -> {
+                if (legacyRawTouchPointerId == null) {
+                    legacyRawTouchPointerId = pointerId
+                    startGesture(scaledX, scaledY)
+                }
+            }
+            RAW_TOUCH_MOVE -> {
+                if (legacyRawTouchPointerId == pointerId) {
+                    continueGesture(scaledX, scaledY)
+                }
+            }
+            RAW_TOUCH_UP, RAW_TOUCH_CANCEL -> {
+                if (legacyRawTouchPointerId == pointerId) {
+                    endGesture(scaledX, scaledY)
+                    legacyRawTouchPointerId = null
+                }
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun dispatchNextRawTouch() {
+        if (rawTouchDispatching) {
+            return
+        }
+
+        while (rawTouchEvents.isNotEmpty()) {
+            val event = rawTouchEvents.removeFirst()
+            val target = rawTouchStrokes[event.pointerId]
+            if (event.action == RAW_TOUCH_DOWN) {
+                if (target != null ||
+                    rawTouchStrokes.size >= GestureDescription.getMaxStrokeCount()
+                ) {
+                    continue
+                }
+                rawTouchStrokes[event.pointerId] = RawTouchStroke(
+                    max(0, event.x),
+                    max(0, event.y),
+                )
+            } else if (target == null) {
+                continue
+            }
+
+            val now = System.currentTimeMillis()
+            val duration = if (rawTouchLastDispatchTime == 0L) {
+                1L
+            } else {
+                (now - rawTouchLastDispatchTime).coerceIn(1L, 32L)
+            }
+            val endX = max(0, event.x)
+            val endY = max(0, event.y)
+            val endsTarget = event.action == RAW_TOUCH_UP ||
+                    event.action == RAW_TOUCH_CANCEL
+            val builder = GestureDescription.Builder()
+
+            try {
+                rawTouchStrokes.forEach { (pointerId, state) ->
+                    val path = Path()
+                    path.moveTo(
+                        (state.x * SCREEN_INFO.scale).toFloat(),
+                        (state.y * SCREEN_INFO.scale).toFloat(),
+                    )
+                    if (pointerId == event.pointerId) {
+                        path.lineTo(
+                            (endX * SCREEN_INFO.scale).toFloat(),
+                            (endY * SCREEN_INFO.scale).toFloat(),
+                        )
+                    }
+                    val willContinue = !(pointerId == event.pointerId && endsTarget)
+                    val nextStroke = state.stroke?.continueStroke(
+                        path,
+                        0,
+                        duration,
+                        willContinue,
+                    ) ?: GestureDescription.StrokeDescription(
+                        path,
+                        0,
+                        duration,
+                        willContinue,
+                    )
+                    builder.addStroke(nextStroke)
+                    state.stroke = nextStroke
+                    if (pointerId == event.pointerId) {
+                        state.x = endX
+                        state.y = endY
+                    }
+                }
+
+                rawTouchDispatching = true
+                val accepted = dispatchGesture(
+                    builder.build(),
+                    object : AccessibilityService.GestureResultCallback() {
+                        override fun onCompleted(gestureDescription: GestureDescription?) {
+                            finishRawTouchDispatch(false)
+                        }
+
+                        override fun onCancelled(gestureDescription: GestureDescription?) {
+                            finishRawTouchDispatch(true)
+                        }
+                    },
+                    null,
+                )
+                if (endsTarget) {
+                    rawTouchStrokes.remove(event.pointerId)
+                }
+                if (accepted) {
+                    rawTouchLastDispatchTime = now
+                    return
+                }
+            } catch (e: Exception) {
+                Log.e(logTag, "dispatch raw touch failed: $e")
+            }
+
+            resetRawTouchState()
+            return
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun finishRawTouchDispatch(cancelled: Boolean) {
+        rawTouchDispatching = false
+        if (cancelled) {
+            resetRawTouchState()
+        } else if (rawTouchStrokes.isEmpty() && rawTouchEvents.isEmpty()) {
+            resetRawTouchState()
+        } else {
+            dispatchNextRawTouch()
+        }
+    }
+
+    private fun resetRawTouchState() {
+        rawTouchEvents.clear()
+        rawTouchStrokes.clear()
+        rawTouchDispatching = false
+        rawTouchLastDispatchTime = 0L
+        legacyRawTouchPointerId = null
     }
 
     @RequiresApi(Build.VERSION_CODES.N)
@@ -745,6 +974,7 @@ class InputService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        resetRawTouchState()
         ctx = null
         // Keep this fallback even though onUnbind usually notifies first.
         notifyInputState()
@@ -752,6 +982,7 @@ class InputService : AccessibilityService() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        resetRawTouchState()
         ctx = null
         notifyInputState()
         return super.onUnbind(intent)

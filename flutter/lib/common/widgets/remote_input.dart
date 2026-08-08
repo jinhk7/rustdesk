@@ -76,6 +76,13 @@ class RawTouchGestureDetectorRegion extends StatefulWidget {
       _RawTouchGestureDetectorRegionState();
 }
 
+class _RawTouchContact {
+  final int id;
+  Offset position;
+
+  _RawTouchContact(this.id, this.position);
+}
+
 /// touchMode only:
 ///   LongPress -> right click
 ///   OneFingerPan -> start/end -> left down start/end
@@ -87,6 +94,8 @@ class RawTouchGestureDetectorRegion extends StatefulWidget {
 ///   HoldDrag -> left drag
 class _RawTouchGestureDetectorRegionState
     extends State<RawTouchGestureDetectorRegion> {
+  static const int _maxRawTouchContacts = 10;
+
   Offset _cacheLongPressPosition = Offset(0, 0);
   // Timestamp of the last long press event.
   int _cacheLongPressPositionTs = 0;
@@ -109,19 +118,123 @@ class _RawTouchGestureDetectorRegionState
   Offset? _lastTapDownPositionForMouseMode;
   // Cache global position for onTap (which lacks position info).
   Offset? _lastTapDownGlobalPosition;
+  final Map<int, _RawTouchContact> _rawTouchContacts = {};
+  late bool _canvasLocked;
 
   FFI get ffi => widget.ffi;
   FfiModel get ffiModel => widget.ffiModel;
   InputModel get inputModel => widget.inputModel;
   bool get handleTouch => (isDesktop || isWebDesktop) || ffiModel.touchMode;
   SessionID get sessionId => ffi.sessionId;
+  bool get rawTouchPassthrough =>
+      isMobile &&
+      _canvasLocked &&
+      ffiModel.isPeerAndroid &&
+      ffiModel.pi.rawTouch;
+
+  @override
+  void initState() {
+    super.initState();
+    _canvasLocked = ffi.canvasModel.locked;
+    ffi.canvasModel.addListener(_onCanvasChanged);
+  }
+
+  @override
+  void didUpdateWidget(covariant RawTouchGestureDetectorRegion oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.ffi != widget.ffi) {
+      oldWidget.ffi.canvasModel.removeListener(_onCanvasChanged);
+      _cancelRawTouchContacts(oldWidget.inputModel);
+      _canvasLocked = ffi.canvasModel.locked;
+      ffi.canvasModel.addListener(_onCanvasChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    ffi.canvasModel.removeListener(_onCanvasChanged);
+    _cancelRawTouchContacts();
+    super.dispose();
+  }
+
+  void _onCanvasChanged() {
+    final locked = ffi.canvasModel.locked;
+    if (locked == _canvasLocked || !mounted) return;
+    if (!locked) {
+      _cancelRawTouchContacts();
+    }
+    setState(() => _canvasLocked = locked);
+  }
 
   @override
   Widget build(BuildContext context) {
+    if (rawTouchPassthrough) {
+      return Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: _onRawPointerDown,
+        onPointerMove: _onRawPointerMove,
+        onPointerUp: _onRawPointerUp,
+        onPointerCancel: _onRawPointerCancel,
+        child: widget.child,
+      );
+    }
     return RawGestureDetector(
       child: widget.child,
       gestures: makeGestures(context),
     );
+  }
+
+  int? _nextRawTouchId() {
+    final used = _rawTouchContacts.values.map((contact) => contact.id).toSet();
+    for (var id = 0; id < _maxRawTouchContacts; ++id) {
+      if (!used.contains(id)) return id;
+    }
+    return null;
+  }
+
+  void _onRawPointerDown(PointerDownEvent event) {
+    if (!kTouchBasedDeviceKinds.contains(event.kind) ||
+        _rawTouchContacts.containsKey(event.pointer)) {
+      return;
+    }
+    final id = _nextRawTouchId();
+    if (id == null) return;
+    if (inputModel.sendRawTouchEvent(
+        id, kTouchPointerActionDown, event.localPosition)) {
+      _rawTouchContacts[event.pointer] =
+          _RawTouchContact(id, event.localPosition);
+    }
+  }
+
+  void _onRawPointerMove(PointerMoveEvent event) {
+    final contact = _rawTouchContacts[event.pointer];
+    if (contact == null) return;
+    contact.position = event.localPosition;
+    inputModel.sendRawTouchEvent(
+        contact.id, kTouchPointerActionMove, event.localPosition);
+  }
+
+  void _onRawPointerUp(PointerUpEvent event) {
+    final contact = _rawTouchContacts.remove(event.pointer);
+    if (contact == null) return;
+    inputModel.sendRawTouchEvent(
+        contact.id, kTouchPointerActionUp, event.localPosition);
+  }
+
+  void _onRawPointerCancel(PointerCancelEvent event) {
+    final contact = _rawTouchContacts.remove(event.pointer);
+    if (contact == null) return;
+    inputModel.sendRawTouchEvent(
+        contact.id, kTouchPointerActionCancel, event.localPosition);
+  }
+
+  void _cancelRawTouchContacts([InputModel? sender]) {
+    final model = sender ?? inputModel;
+    for (final contact in _rawTouchContacts.values) {
+      model.sendRawTouchEvent(
+          contact.id, kTouchPointerActionCancel, contact.position);
+    }
+    _rawTouchContacts.clear();
   }
 
   bool isNotTouchBasedDevice() {
@@ -454,6 +567,8 @@ class _RawTouchGestureDetectorRegionState
     if (isSpecialHoldDragActive) {
       // Initialize the last focal point to calculate deltas manually.
       _lastSpecialHoldDragFocalPoint = d.focalPoint;
+    } else if (_canvasLocked) {
+      return;
     }
   }
 
@@ -470,6 +585,8 @@ class _RawTouchGestureDetectorRegionState
       await ffi.cursorModel.updatePan(delta * 2.0, d.focalPoint, handleTouch);
       return;
     }
+
+    if (_canvasLocked) return;
 
     if ((isDesktop || isWebDesktop)) {
       final scale = ((d.scale - _scale) * 1000).toInt();
@@ -494,6 +611,10 @@ class _RawTouchGestureDetectorRegionState
 
   onTwoFingerScaleEnd(ScaleEndDetails d) async {
     if (isNotTouchBasedDevice()) {
+      return;
+    }
+    if (_canvasLocked && !isSpecialHoldDragActive) {
+      _scale = 1;
       return;
     }
     if ((isDesktop || isWebDesktop)) {

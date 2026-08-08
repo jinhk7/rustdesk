@@ -29,6 +29,8 @@ use crate::{common::DEVICE_NAME, flutter::connection_manager::start_channel};
 use cidr_utils::cidr::IpCidr;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+use hbb_common::protobuf::{Message as _, UnknownValueRef};
 use hbb_common::{
     config::{
         self, decode_permanent_password_h1_from_storage, decode_preset_password_h1_from_storage,
@@ -51,6 +53,8 @@ use hbb_common::{
 };
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use scrap::android::{call_main_service_key_event, call_main_service_pointer_input};
+#[cfg(target_os = "android")]
+use scrap::android::call_main_service_get_by_name;
 use scrap::camera;
 use serde_derive::Serialize;
 use serde_json::{json, value::Value};
@@ -72,6 +76,97 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+const RAW_TOUCH_POINTER_FIELD_NUMBER: u32 = 5;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const RAW_TOUCH_MASK: i32 = 0x10000;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const RAW_TOUCH_POINTER_SHIFT: u32 = 8;
+#[cfg(target_os = "android")]
+const RAW_TOUCH_CANCEL_ALL: i32 = 4;
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+struct RawTouchPointerEvent {
+    pointer_id: u32,
+    action: u32,
+    x: i32,
+    y: i32,
+}
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+fn read_protobuf_varint(input: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *input.get(*cursor)?;
+        *cursor += 1;
+        if shift == 63 && byte > 1 {
+            return None;
+        }
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+fn skip_protobuf_value(input: &[u8], cursor: &mut usize, wire_type: u64) -> Option<()> {
+    let size = match wire_type {
+        0 => {
+            read_protobuf_varint(input, cursor)?;
+            return Some(());
+        }
+        1 => 8,
+        2 => usize::try_from(read_protobuf_varint(input, cursor)?).ok()?,
+        5 => 4,
+        _ => return None,
+    };
+    *cursor = (*cursor).checked_add(size)?;
+    (*cursor <= input.len()).then_some(())
+}
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+fn decode_touch_pointer_event(touch: &TouchEvent) -> Option<RawTouchPointerEvent> {
+    let UnknownValueRef::LengthDelimited(input) = touch
+        .unknown_fields()
+        .get(RAW_TOUCH_POINTER_FIELD_NUMBER)?
+    else {
+        return None;
+    };
+    let (mut pointer_id, mut action, mut x, mut y) = (None, None, None, None);
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let key = read_protobuf_varint(input, &mut cursor)?;
+        let field_number = key >> 3;
+        let wire_type = key & 0x07;
+        if field_number == 0 {
+            return None;
+        }
+        if (1..=4).contains(&field_number) {
+            if wire_type != 0 {
+                return None;
+            }
+            let value = read_protobuf_varint(input, &mut cursor)?;
+            match field_number {
+                1 => pointer_id = u32::try_from(value).ok(),
+                2 => action = u32::try_from(value).ok(),
+                3 => x = Some(value as u32 as i32),
+                4 => y = Some(value as u32 as i32),
+                _ => return None,
+            }
+        } else {
+            skip_protobuf_value(input, &mut cursor, wire_type)?;
+        }
+    }
+    Some(RawTouchPointerEvent {
+        pointer_id: pointer_id?,
+        action: action?,
+        x: x?,
+        y: y?,
+    })
+}
 
 const FAILURE_IDX_ID_WHITELIST: usize = 2;
 // How long a rejection counts, so also how long a blocked address stays blocked. Longer
@@ -1851,6 +1946,14 @@ impl Connection {
             pi.platform_additions = serde_json::to_string(&platform_additions).unwrap_or("".into());
         }
 
+        #[cfg(target_os = "android")]
+        {
+            let raw_touch = call_main_service_get_by_name("raw_touch")
+                .map(|value| value == "true")
+                .unwrap_or(false);
+            pi.platform_additions = json!({ "raw_touch": raw_touch }).to_string();
+        }
+
         if self.port_forward_socket.is_some() {
             let mut msg_out = Message::new();
             res.set_peer_info(pi);
@@ -2982,28 +3085,46 @@ impl Connection {
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     if let Err(e) = match pde.union {
-                        Some(pointer_device_event::Union::TouchEvent(touch)) => match touch.union {
-                            Some(touch_event::Union::PanStart(pan_start)) => {
-                                call_main_service_pointer_input(
-                                    "touch",
-                                    4,
-                                    pan_start.x,
-                                    pan_start.y,
-                                )
+                        Some(pointer_device_event::Union::TouchEvent(touch)) => {
+                            if let Some(pointer) = decode_touch_pointer_event(&touch) {
+                                if pointer.pointer_id > u8::MAX as u32 || pointer.action > 3 {
+                                    Ok(())
+                                } else {
+                                    let mask = RAW_TOUCH_MASK
+                                        | ((pointer.pointer_id << RAW_TOUCH_POINTER_SHIFT)
+                                            | pointer.action)
+                                            as i32;
+                                    call_main_service_pointer_input(
+                                        "touch", mask, pointer.x, pointer.y,
+                                    )
+                                }
+                            } else {
+                                match touch.union {
+                                    Some(touch_event::Union::PanStart(pan_start)) => {
+                                        call_main_service_pointer_input(
+                                            "touch",
+                                            4,
+                                            pan_start.x,
+                                            pan_start.y,
+                                        )
+                                    }
+                                    Some(touch_event::Union::PanUpdate(pan_update)) => {
+                                        call_main_service_pointer_input(
+                                            "touch",
+                                            5,
+                                            pan_update.x,
+                                            pan_update.y,
+                                        )
+                                    }
+                                    Some(touch_event::Union::PanEnd(pan_end)) => {
+                                        call_main_service_pointer_input(
+                                            "touch", 6, pan_end.x, pan_end.y,
+                                        )
+                                    }
+                                    _ => Ok(()),
+                                }
                             }
-                            Some(touch_event::Union::PanUpdate(pan_update)) => {
-                                call_main_service_pointer_input(
-                                    "touch",
-                                    5,
-                                    pan_update.x,
-                                    pan_update.y,
-                                )
-                            }
-                            Some(touch_event::Union::PanEnd(pan_end)) => {
-                                call_main_service_pointer_input("touch", 6, pan_end.x, pan_end.y)
-                            }
-                            _ => Ok(()),
-                        },
+                        }
                         _ => Ok(()),
                     } {
                         log::debug!("call_main_service_pointer_input fail:{}", e);
@@ -4939,6 +5060,17 @@ impl Connection {
             return;
         }
         self.closed = true;
+        #[cfg(target_os = "android")]
+        if self.authorized && self.is_remote() {
+            if let Err(e) = call_main_service_pointer_input(
+                "touch",
+                RAW_TOUCH_MASK | RAW_TOUCH_CANCEL_ALL,
+                0,
+                0,
+            ) {
+                log::debug!("cancel raw touch input failed: {}", e);
+            }
+        }
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
         //
@@ -6904,6 +7036,22 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 mod test {
     #[allow(unused)]
     use super::*;
+    use hbb_common::protobuf::Message as _;
+
+    #[test]
+    fn test_decode_touch_pointer_event() {
+        let mut touch = TouchEvent::new();
+        touch.mut_unknown_fields().add_length_delimited(
+            RAW_TOUCH_POINTER_FIELD_NUMBER,
+            vec![0x08, 0x09, 0x10, 0x02, 0x18, 0xac, 0x02, 0x20, 0x90, 0x03],
+        );
+
+        let pointer = decode_touch_pointer_event(&touch).unwrap();
+        assert_eq!(pointer.pointer_id, 9);
+        assert_eq!(pointer.action, 2);
+        assert_eq!(pointer.x, 300);
+        assert_eq!(pointer.y, 400);
+    }
 
     #[test]
     fn test_wildcard_match() {
